@@ -7,7 +7,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 from Crypto.Cipher import AES
-from flask import Flask, jsonify
+from flask import Flask, Response, jsonify
 import paho.mqtt.client as mqtt
 
 
@@ -133,12 +133,28 @@ def get_history():
 
 @app.get("/")
 def index():
-    return jsonify({
-        "service": "ESP32 encrypted FHIR receiver",
-        "latest": "/api/v1/vitals",
-        "history": "/api/v1/history",
-        "health": "/healthz",
-    })
+    return Response("""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Health Monitor</title><style>
+*{box-sizing:border-box}body{margin:0;background:#07111f;color:#e5edf8;font-family:Arial,sans-serif}
+main{max-width:1050px;margin:auto;padding:32px 20px}header{display:flex;justify-content:space-between;align-items:center;gap:16px;margin-bottom:28px}
+h1{margin:0;font-size:1.7rem}.sub{color:#9fb0c8;margin-top:7px}.state{padding:8px 12px;border-radius:20px;background:#182a42;color:#b7caff;font-size:.9rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px}.card{background:#101e31;border:1px solid #243a57;border-radius:14px;padding:18px}
+.label{color:#9fb0c8;font-size:.85rem}.value{font-size:2rem;font-weight:700;margin-top:8px}.unit{font-size:.9rem;color:#9fb0c8;margin-left:4px}
+section{margin-top:28px;background:#101e31;border:1px solid #243a57;border-radius:14px;padding:18px}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:10px;border-bottom:1px solid #243a57}th{color:#9fb0c8}.empty{color:#9fb0c8}
+</style></head><body><main><header><div><h1>ESP32 Health Monitor</h1><div class="sub">Encrypted FHIR telemetry</div></div><div class="state" id="state">Connecting…</div></header>
+<div class="grid" id="cards"></div><section><h2>Recent samples</h2><div id="recent" class="empty">Waiting for readings from the ESP32…</div></section></main>
+<script>
+const fields=[['heart_rate_bpm','Heart rate','bpm'],['systolic_bp_mmhg','Systolic BP','mmHg'],['diastolic_bp_mmhg','Diastolic BP','mmHg'],['spo2_percent','SpO₂','%'],['temperature_c','Temperature','°C'],['respiratory_rate_bpm','Respiratory rate','breaths/min'],['ptt_ms','PTT','ms']];
+const cards=document.querySelector('#cards'); cards.innerHTML=fields.map(([key,label,unit])=>`<div class="card"><div class="label">${label}</div><div class="value" id="${key}">--<span class="unit">${unit}</span></div></div>`).join('');
+function show(v){return Number.isFinite(v)?(Math.round(v*10)/10):'--'}
+async function refresh(){try{const [vitals,health,history]=await Promise.all([fetch('/api/v1/vitals').then(r=>r.json()),fetch('/healthz').then(r=>r.json()),fetch('/api/v1/history').then(r=>r.json())]);
+fields.forEach(([key,,unit])=>document.getElementById(key).innerHTML=`${show(vitals.vitals[key])}<span class="unit">${unit}</span>`);
+document.getElementById('state').textContent=health.mqtt_connected?'MQTT connected':'Waiting for MQTT';
+const recent=document.getElementById('recent'); if(!history.length){recent.textContent='Waiting for readings from the ESP32…';return}
+recent.innerHTML='<table><thead><tr><th>Received</th><th>Heart rate</th><th>SpO₂</th><th>Temperature</th></tr></thead><tbody>'+history.slice(-10).reverse().map(s=>`<tr><td>${new Date(s.received_at).toLocaleTimeString()}</td><td>${show(s.vitals.heart_rate_bpm)} bpm</td><td>${show(s.vitals.spo2_percent)}%</td><td>${show(s.vitals.temperature_c)} °C</td></tr>`).join('')+'</tbody></table>';
+}catch(e){document.getElementById('state').textContent='Dashboard connection error'}} refresh(); setInterval(refresh,3000);
+</script></body></html>""", mimetype="text/html")
 
 
 if __name__ == "__main__":
