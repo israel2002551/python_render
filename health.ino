@@ -18,38 +18,39 @@
 #include <SparkFun_ICM_20948.h>
 #include <Adafruit_MLX90614.h>
 #include <mbedtls/gcm.h>
+#include <algorithm>
+#include <memory>
+#include <vector>
+#include "secrets.h"
 
 // ===== CONFIG =====
-#define I2C_SDA 21
-#define I2C_SCL 22
+// ESP32-S3 baseline pin map (for example, ESP32-S3-DevKitC).
+// GPIO 1-20 are ADC-capable; GPIO 19/20 are avoided because they are USB.
+// Do not use GPIO 26-32: those pins are commonly reserved for flash/PSRAM.
+#define I2C_SDA 8
+#define I2C_SCL 9
 
-#define ECG_PIN 34
-#define ECG_LO_PLUS 25
-#define ECG_LO_MINUS 26
+#define ECG_PIN 4
+#define ECG_LO_PLUS 5
+#define ECG_LO_MINUS 6
 
-#define ADS_CS 5
-#define ADS_SCK 18
-#define ADS_MISO 19
-#define ADS_MOSI 23
-#define ADS_DRDY 27
-#define ADS_START 32
-#define ADS_PWDN 33
+#define ADS_CS 10
+#define ADS_SCK 12
+#define ADS_MISO 13
+#define ADS_MOSI 14
+#define ADS_DRDY 15
+#define ADS_START 16
+#define ADS_PWDN 17
 
-#define BUZZER_PIN 13
-#define BTN1 14
-#define BTN2 15
+#define BUZZER_PIN 18
+#define BTN1 21
+#define BTN2 38
 
 const char* ssid = "YOUR_WIFI";
 const char* password = "YOUR_PASS";
 const char* mqtt_server = "broker.hivemq.com";
 const int mqtt_port = 1883;
 const char* mqtt_topic = "health/fhir";
-
-// AES key prototype only. Replace with secure provisioning in production.
-const uint8_t AES_KEY[16] = {
-  0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef,
-  0x01,0x23,0x45,0x67,0x89,0xab,0xcd,0xef
-};
 
 // ===== OBJECTS =====
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -62,13 +63,14 @@ PubSubClient client(espClient);
 // ===== SHARED GLOBALS =====
 portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
 
-volatile float heartRate = 75.0;
-volatile float SpO2 = 98.0;
-volatile float tempC = 36.5;
-volatile float SBP = 120.0;
-volatile float DBP = 80.0;
-volatile float RespRate = 16.0;
-volatile float PTT_ms = 120.0;
+volatile float heartRate = NAN;
+volatile float SpO2 = NAN;
+volatile float tempC = NAN;
+volatile float SBP = NAN;
+volatile float DBP = NAN;
+volatile float RespRate = NAN;
+volatile float PTT_ms = NAN;
+volatile bool ecgLeadOff = true;
 
 volatile long ads_ecg_ch1 = 0;
 volatile long ads_ecg_ch2 = 0;
@@ -87,10 +89,12 @@ volatile int ecg_idx = 0;
 std::vector<unsigned long> rpeaks_us;
 std::vector<unsigned long> ppg_foot_us;
 std::vector<float> ptt_list;
+std::vector<unsigned long> breath_peaks_us;
 
 // IR amplitude window
 volatile uint64_t ir_sum_window = 0;
 volatile int ir_count_window = 0;
+volatile float ppg_ac_peak_window = 0.0f;
 
 // IMU magnitude
 volatile float acc_mag = 0.0;
@@ -215,10 +219,12 @@ long ads1292_read24_signed() {
   return v;
 }
 
-void ads1292_read_once() {
+bool ads1292_read_once(unsigned long ts_us) {
   if (digitalRead(ADS_DRDY) == LOW) {
     SPI.beginTransaction(SPISettings(2000000, MSBFIRST, SPI_MODE1));
     digitalWrite(ADS_CS, LOW);
+    // An ADS1292R RDATAC frame begins with three status bytes.
+    ads1292_read24_signed();
     long ch1 = ads1292_read24_signed();
     long ch2 = ads1292_read24_signed();
     digitalWrite(ADS_CS, HIGH);
@@ -228,14 +234,18 @@ void ads1292_read_once() {
     ads_ecg_ch2 = ch2;
     ads_resp_raw = ch2;
     portEXIT_CRITICAL(&mux);
+    return true;
   }
+  return false;
 }
 
-// ===== PTT extraction (simple, robust) =====
-float ecg_hp_prev = 0, ecg_lp_prev = 0;
+// ===== PTT extraction and signal conditioning =====
+float ecg_hp_prev = 0;
+float ecg_hp_input_prev = 0;
+float ecg_lp_prev = 0;
 float ecg_highpass(float x) {
-  float y = 0.995f * (ecg_hp_prev + x - ecg_lp_prev);
-  ecg_lp_prev = x;
+  float y = 0.995f * (ecg_hp_prev + x - ecg_hp_input_prev);
+  ecg_hp_input_prev = x;
   ecg_hp_prev = y;
   return y;
 }
@@ -253,32 +263,74 @@ void process_ecg_sample(int raw, unsigned long ts_us) {
   ecg_ts[ecg_idx] = ts_us;
   ecg_idx = (ecg_idx + 1) % ECG_BUF_LEN;
 
-  static float threshold = 0;
-  static float peak_val = 0;
+  static float signal_level = 250.0f;
+  static float noise_level = 50.0f;
+  static float peak_val = 0.0f;
   static unsigned long peak_time = 0;
-  if (lp > threshold) {
-    if (lp > peak_val) { peak_val = lp; peak_time = ts_us; }
-  } else {
-    if (peak_val > 200) {
-      if (rpeaks_us.empty() || (peak_time - rpeaks_us.back()) > 300000) {
+  static float previous = 0.0f;
+  const float magnitude = fabsf(lp);
+  const float threshold = noise_level + 0.35f * (signal_level - noise_level);
+
+  if (magnitude >= previous && magnitude > threshold) {
+    if (magnitude > peak_val) { peak_val = magnitude; peak_time = ts_us; }
+  } else if (peak_val > 0.0f) {
+    if (peak_val > threshold &&
+        (rpeaks_us.empty() || (peak_time - rpeaks_us.back()) > 300000UL)) {
         rpeaks_us.push_back(peak_time);
         if (rpeaks_us.size() > 500) rpeaks_us.erase(rpeaks_us.begin());
-      }
+        if (rpeaks_us.size() >= 2) {
+          const unsigned long interval = rpeaks_us.back() - rpeaks_us[rpeaks_us.size() - 2];
+          if (interval >= 300000UL && interval <= 1500000UL) {
+            portENTER_CRITICAL(&mux);
+            heartRate = 60000000.0f / interval;
+            portEXIT_CRITICAL(&mux);
+          }
+        }
+      signal_level = 0.875f * signal_level + 0.125f * peak_val;
+    } else {
+      noise_level = 0.875f * noise_level + 0.125f * peak_val;
     }
-    threshold = 0.995f * threshold + 0.005f * peak_val;
     peak_val = 0;
   }
+  previous = magnitude;
 }
-void process_ppg_sample(long ir_value, unsigned long ts_us) {
-  static long prev_ir = 0;
-  static long prev_diff = 0;
-  long diff = ir_value - prev_ir;
-  if (prev_diff < 0 && diff > 0 && ir_value < 50000) {
+void process_ppg_sample(long red_value, long ir_value, unsigned long ts_us) {
+  static float ir_dc = 0.0f, red_dc = 0.0f;
+  static float previous_ac = 0.0f, previous_diff = 0.0f;
+  static bool initialized = false;
+  if (!initialized) {
+    ir_dc = ir_value;
+    red_dc = red_value;
+    initialized = true;
+    return;
+  }
+
+  ir_dc += 0.01f * (ir_value - ir_dc);
+  red_dc += 0.01f * (red_value - red_dc);
+  const float ir_ac = ir_value - ir_dc;
+  const float red_ac = red_value - red_dc;
+  const float diff = ir_ac - previous_ac;
+
+  // The PPG foot is the local AC minimum. Reject implausibly close feet.
+  if (previous_diff < 0.0f && diff >= 0.0f && ir_dc > 15000.0f &&
+      (ppg_foot_us.empty() || (ts_us - ppg_foot_us.back()) > 300000UL)) {
     ppg_foot_us.push_back(ts_us);
     if (ppg_foot_us.size() > 500) ppg_foot_us.erase(ppg_foot_us.begin());
   }
-  prev_ir = ir_value;
-  prev_diff = diff;
+
+  const float ir_ratio = fabsf(ir_ac) / ir_dc;
+  const float red_ratio = fabsf(red_ac) / red_dc;
+  if (ir_ratio > 0.002f && red_ratio > 0.0f) {
+    const float ratio_of_ratios = red_ratio / ir_ratio;
+    const float spo2 = constrain(110.0f - 25.0f * ratio_of_ratios, 70.0f, 100.0f);
+    portENTER_CRITICAL(&mux);
+    SpO2 = 0.9f * SpO2 + 0.1f * spo2;
+    if (isnan(SpO2)) SpO2 = spo2;
+    ppg_ac_peak_window = max(ppg_ac_peak_window, fabsf(ir_ac));
+    portEXIT_CRITICAL(&mux);
+  }
+  previous_ac = ir_ac;
+  previous_diff = diff;
 
   portENTER_CRITICAL(&mux);
   ir_sum_window += (uint64_t)ir_value;
@@ -286,14 +338,59 @@ void process_ppg_sample(long ir_value, unsigned long ts_us) {
   portEXIT_CRITICAL(&mux);
 }
 
+// Feed this function with a channel wired/configured for a respiratory waveform.
+// It tracks slow local maxima and accepts only 6-40 breaths/min.
+void process_respiration_sample(long raw, unsigned long ts_us) {
+  static float baseline = 0.0f, filtered = 0.0f, previous = 0.0f;
+  static float signal_level = 100.0f, noise_level = 20.0f, peak = 0.0f;
+  static unsigned long peak_time = 0;
+  static bool initialized = false;
+  if (!initialized) {
+    baseline = raw;
+    initialized = true;
+    return;
+  }
+
+  baseline += 0.002f * (raw - baseline);       // remove electrode DC drift
+  filtered += 0.03f * ((raw - baseline) - filtered); // retain breathing band
+  const float magnitude = fabsf(filtered);
+  const float threshold = noise_level + 0.40f * (signal_level - noise_level);
+
+  if (magnitude >= previous && magnitude > threshold) {
+    if (magnitude > peak) { peak = magnitude; peak_time = ts_us; }
+  } else if (peak > 0.0f) {
+    if (peak > threshold &&
+        (breath_peaks_us.empty() || (peak_time - breath_peaks_us.back()) > 1500000UL)) {
+      breath_peaks_us.push_back(peak_time);
+      if (breath_peaks_us.size() > 30) breath_peaks_us.erase(breath_peaks_us.begin());
+      if (breath_peaks_us.size() >= 2) {
+        const unsigned long interval = breath_peaks_us.back() - breath_peaks_us[breath_peaks_us.size() - 2];
+        if (interval >= 1500000UL && interval <= 10000000UL) {
+          const float rr = 60000000.0f / interval;
+          portENTER_CRITICAL(&mux);
+          RespRate = isnan(RespRate) ? rr : 0.8f * RespRate + 0.2f * rr;
+          portEXIT_CRITICAL(&mux);
+        }
+      }
+      signal_level = 0.9f * signal_level + 0.1f * peak;
+    } else {
+      noise_level = 0.9f * noise_level + 0.1f * peak;
+    }
+    peak = 0.0f;
+  }
+  previous = magnitude;
+}
+
 void compute_ptt_window() {
   ptt_list.clear();
+  const unsigned long now_us = micros();
   for (size_t i = 0; i < rpeaks_us.size(); ++i) {
     unsigned long r = rpeaks_us[i];
+    if ((unsigned long)(now_us - r) > 10000000UL) continue; // latest 10 seconds
     for (size_t j = 0; j < ppg_foot_us.size(); ++j) {
       if (ppg_foot_us[j] > r) {
         float ptt_ms = (ppg_foot_us[j] - r) / 1000.0f;
-        if (ptt_ms > 50 && ptt_ms < 500) ptt_list.push_back(ptt_ms);
+        if (ptt_ms > 80 && ptt_ms < 350) ptt_list.push_back(ptt_ms);
         break;
       }
     }
@@ -320,15 +417,18 @@ bool pass_confidence_gating() {
     ptt_std = sqrt(var);
   }
   uint64_t ir_sum = 0; int ir_count = 0;
+  float ppg_ac_peak = 0;
   float acc = 0, hr = 0;
   portENTER_CRITICAL(&mux);
   ir_sum = ir_sum_window; ir_count = ir_count_window; acc = acc_mag; hr = heartRate;
+  ppg_ac_peak = ppg_ac_peak_window;
   portEXIT_CRITICAL(&mux);
   float ir_avg = (ir_count > 0) ? (float)ir_sum / ir_count : 0.0f;
 
   if (valid_pairs < 5) return false;
   if (ptt_std > 20.0) return false;
   if (ir_avg < 15000.0) return false;
+  if (ppg_ac_peak < 100.0f) return false;
   if (acc > 1.5) return false;
   if (hr < 40 || hr > 180) return false;
   return true;
@@ -381,7 +481,8 @@ float compute_linear(const LinearModel &m, const std::vector<float> &x) {
 
 // ===== FHIR builder =====
 String buildFHIRBundleJson(float hr, float sbp, float dbp, float spo2, float tC, float rr, float ptt) {
-  StaticJsonDocument<1024> doc;
+  // Seven nested Observation resources do not reliably fit in 1 KB.
+  DynamicJsonDocument doc(4096);
   doc["resourceType"] = "Bundle";
   doc["type"] = "collection";
   JsonArray entry = doc.createNestedArray("entry");
@@ -423,79 +524,106 @@ void TaskSensors(void *pvParameters) {
   Wire.begin(I2C_SDA, I2C_SCL);
   Wire.setClock(400000);
   lcd.init(); lcd.backlight();
-  particleSensor.begin();
-  particleSensor.setup();
-  imu.begin(Wire, 0);
-  mlx.begin();
+  if (!particleSensor.begin(Wire, I2C_SPEED_FAST)) Serial.println("MAX30105 not found");
+  // 100 samples/sec, IR + red LEDs, 411 us pulse width and 4-sample averaging.
+  particleSensor.setup(0x1F, 4, 2, 100, 411, 4096);
+  if (imu.begin(Wire, 0) != ICM_20948_Stat_Ok) Serial.println("ICM-20948 not found");
+  if (!mlx.begin()) Serial.println("MLX90614 not found");
   ads1292_init();
 
   unsigned long lastComputePTT = millis();
+  unsigned long lastImuRead = 0;
+  unsigned long lastTemperatureRead = 0;
+  unsigned long lastDisplayUpdate = 0;
 
   while (true) {
     unsigned long now = millis();
 
     int ecgVal = analogRead(ECG_PIN);
     unsigned long t_us = micros();
-    process_ecg_sample(ecgVal, t_us);
+    const bool lead_off = digitalRead(ECG_LO_PLUS) || digitalRead(ECG_LO_MINUS);
+    portENTER_CRITICAL(&mux);
+    ecgLeadOff = lead_off;
+    if (lead_off) heartRate = NAN;
+    portEXIT_CRITICAL(&mux);
+    if (!lead_off) process_ecg_sample(ecgVal, t_us);
 
     particleSensor.check();
     if (particleSensor.available()) {
       long ir = particleSensor.getIR();
       unsigned long ppg_ts = micros();
-      process_ppg_sample(ir, ppg_ts);
       long red = particleSensor.getRed();
-      if (ir > 0) {
-        float R = (float)red / (float)ir;
-        float spo2 = 110.0 - 25.0 * R;
-        spo2 = constrain(spo2, 50.0, 100.0);
-        portENTER_CRITICAL(&mux); SpO2 = spo2; lastPPGMicros = micros(); portEXIT_CRITICAL(&mux);
-      }
+      process_ppg_sample(red, ir, ppg_ts);
+      portENTER_CRITICAL(&mux); lastPPGMicros = micros(); portEXIT_CRITICAL(&mux);
+      particleSensor.nextSample();
     }
 
-    ads1292_read_once();
-
-    imu.getAGMT();
-    float ax = imu.ax, ay = imu.ay, az = imu.az;
-    float acc = sqrt(ax*ax + ay*ay + az*az);
-    portENTER_CRITICAL(&mux); acc_mag = acc; portEXIT_CRITICAL(&mux);
-    if (acc > 2.0) {
-      digitalWrite(BUZZER_PIN, HIGH);
-      vTaskDelay(20 / portTICK_PERIOD_MS);
-      digitalWrite(BUZZER_PIN, LOW);
+    if (ads1292_read_once(t_us)) {
+      long respiration_raw;
+      portENTER_CRITICAL(&mux);
+      respiration_raw = ads_resp_raw;
+      portEXIT_CRITICAL(&mux);
+      process_respiration_sample(respiration_raw, t_us);
     }
 
-    float tC = mlx.readObjectTempC();
-    if (!isnan(tC) && tC > 20 && tC < 45) { portENTER_CRITICAL(&mux); tempC = tC; portEXIT_CRITICAL(&mux); }
+    if (now - lastImuRead >= 50) {
+      lastImuRead = now;
+      imu.getAGMT();
+      float ax = imu.ax, ay = imu.ay, az = imu.az;
+      float acc = sqrt(ax*ax + ay*ay + az*az);
+      portENTER_CRITICAL(&mux); acc_mag = acc; portEXIT_CRITICAL(&mux);
+    }
+
+    if (now - lastTemperatureRead >= 1000) {
+      lastTemperatureRead = now;
+      float tC = mlx.readObjectTempC();
+      if (!isnan(tC) && tC > 20 && tC < 45) { portENTER_CRITICAL(&mux); tempC = tC; portEXIT_CRITICAL(&mux); }
+    }
 
     if (millis() - lastComputePTT >= 2000) {
       compute_ptt_window();
       lastComputePTT = millis();
-      portENTER_CRITICAL(&mux); ir_sum_window = 0; ir_count_window = 0; portEXIT_CRITICAL(&mux);
+      portENTER_CRITICAL(&mux); ir_sum_window = 0; ir_count_window = 0; ppg_ac_peak_window = 0; portEXIT_CRITICAL(&mux);
     }
 
-    portENTER_CRITICAL(&mux);
-    float hr_disp = heartRate, spo2_disp = SpO2, sbp_disp = SBP, dbp_disp = DBP, temp_disp = tempC, rr_disp = RespRate;
-    portEXIT_CRITICAL(&mux);
-    lcd.clear();
-    lcd.setCursor(0,0);
-    lcd.printf("HR:%d RR:%d", (int)hr_disp, (int)rr_disp);
-    lcd.setCursor(0,1);
-    lcd.printf("BP:%d/%d S:%d T:%.1f", (int)sbp_disp, (int)dbp_disp, (int)spo2_disp, temp_disp);
+    if (now - lastDisplayUpdate >= 500) {
+      lastDisplayUpdate = now;
+      portENTER_CRITICAL(&mux);
+      float hr_disp = heartRate, spo2_disp = SpO2, sbp_disp = SBP, dbp_disp = DBP, temp_disp = tempC, rr_disp = RespRate;
+      portEXIT_CRITICAL(&mux);
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      if (isnan(hr_disp)) lcd.print("HR:--"); else lcd.printf("HR:%3d", (int)hr_disp);
+      if (isnan(rr_disp)) lcd.print(" RR:--"); else lcd.printf(" RR:%2d", (int)rr_disp);
+      lcd.setCursor(0, 1);
+      if (isnan(spo2_disp)) lcd.print("S:--"); else lcd.printf("S:%3d", (int)spo2_disp);
+      if (isnan(temp_disp)) lcd.print(" T:--.-"); else lcd.printf(" T:%4.1f", temp_disp);
+    }
 
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    // Sensor acquisition needs a short yielding delay; a one-second delay makes
+    // ECG/PTT extraction unusable at the configured 500 Hz sampling rate.
+    vTaskDelay(2 / portTICK_PERIOD_MS);
   }
 }
 
 void TaskIoT(void *pvParameters) {
   load_model_from_spiffs("/ptt_ridge_model.json");
 
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) { vTaskDelay(500 / portTICK_PERIOD_MS); }
   client.setServer(mqtt_server, mqtt_port);
+  const String mqtt_client_id = "ESP32FHIR-" + String((uint32_t)ESP.getEfuseMac(), HEX);
 
   while (true) {
+    if (WiFi.status() != WL_CONNECTED) {
+      WiFi.reconnect();
+      vTaskDelay(1000 / portTICK_PERIOD_MS);
+      continue;
+    }
     if (!client.connected()) {
-      if (!client.connect("ESP32FHIRClient")) { vTaskDelay(5000 / portTICK_PERIOD_MS); continue; }
+      if (!client.connect(mqtt_client_id.c_str())) { vTaskDelay(5000 / portTICK_PERIOD_MS); continue; }
       client.subscribe("health/cmd");
     }
     client.loop();
@@ -538,9 +666,13 @@ std::vector<float> x;
 
 void setup() {
   Serial.begin(115200);
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(BTN1, INPUT_PULLUP);
   pinMode(BTN2, INPUT_PULLUP);
+  pinMode(ECG_LO_PLUS, INPUT);
+  pinMode(ECG_LO_MINUS, INPUT);
   SPIFFS.begin(true);
   xTaskCreatePinnedToCore(TaskSensors, "Sensors", 20000, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(TaskIoT, "IoT", 20000, NULL, 1, NULL, 0);
