@@ -238,12 +238,12 @@ section{margin-top:28px;background:#101e31;border:1px solid #243a57;border-radiu
 <section><h2>Live trends</h2><div class="chart-grid">
 <div class="chart"><p class="chart-title">Heart rate</p><canvas data-key="heart_rate_bpm" data-color="#ff6b6b"></canvas></div>
 <div class="chart"><p class="chart-title">Blood oxygen (SpO₂)</p><canvas data-key="spo2_percent" data-color="#43d9a3"></canvas></div>
-<div class="chart"><p class="chart-title">Temperature</p><canvas data-key="temperature_c" data-color="#bc7cff"></canvas></div>
+<div class="chart"><p class="chart-title">Ambient temperature</p><canvas data-key="temperature_c" data-color="#bc7cff"></canvas></div>
 <div class="chart"><p class="chart-title">Respiratory rate</p><canvas data-key="respiratory_rate_bpm" data-color="#ffd166"></canvas></div>
 </div></section>
 <div class="welcome" id="welcomeDialog" role="dialog" aria-modal="true" aria-labelledby="welcomeTitle"><div class="welcome-card"><h2 id="welcomeTitle">Welcome to Health Monitor</h2><p>Your live vital readings will appear after you start monitoring.</p><button class="button" id="start" type="button">Start monitoring</button></div></div>
 <script>
-const fields=[['heart_rate_bpm','Heart rate','bpm'],['systolic_bp_mmhg','Systolic BP','mmHg'],['diastolic_bp_mmhg','Diastolic BP','mmHg'],['spo2_percent','SpO₂','%'],['temperature_c','Temperature','°C'],['respiratory_rate_bpm','Respiratory rate','breaths/min'],['ptt_ms','PTT','ms']];
+const fields=[['heart_rate_bpm','Heart rate','bpm'],['systolic_bp_mmhg','Systolic BP','mmHg'],['diastolic_bp_mmhg','Diastolic BP','mmHg'],['spo2_percent','SpO₂','%'],['temperature_c','Ambient temperature','°C'],['respiratory_rate_bpm','Respiratory rate','breaths/min'],['ptt_ms','PTT','ms']];
 const cards=document.querySelector('#cards'); cards.innerHTML=fields.map(([key,label,unit])=>`<div class="card"><div class="label">${label}</div><div class="value" id="${key}">--<span class="unit">${unit}</span></div></div>`).join('');
 document.getElementById('start').addEventListener('click',()=>document.getElementById('welcomeDialog').classList.add('hidden'));
 const predictButton=document.getElementById('predict'),prediction=document.getElementById('prediction');
@@ -256,7 +256,7 @@ fields.forEach(([key,,unit])=>document.getElementById(key).innerHTML=`${show(vit
 document.getElementById('state').textContent=health.mqtt_connected?'MQTT connected':'Waiting for MQTT';
 drawCharts(history);
 const recent=document.getElementById('recent'); if(!history.length){recent.textContent='Waiting for readings from the ESP32…';return}
-recent.innerHTML='<table><thead><tr><th>Received</th><th>Heart rate</th><th>SpO₂</th><th>Temperature</th></tr></thead><tbody>'+history.slice(-10).reverse().map(s=>`<tr><td>${new Date(s.received_at).toLocaleTimeString()}</td><td>${show(s.vitals.heart_rate_bpm)} bpm</td><td>${show(s.vitals.spo2_percent)}%</td><td>${show(s.vitals.temperature_c)} °C</td></tr>`).join('')+'</tbody></table>';
+recent.innerHTML='<table><thead><tr><th>Received</th><th>Heart rate</th><th>SpO₂</th><th>Ambient temperature</th></tr></thead><tbody>'+history.slice(-10).reverse().map(s=>`<tr><td>${new Date(s.received_at).toLocaleTimeString()}</td><td>${show(s.vitals.heart_rate_bpm)} bpm</td><td>${show(s.vitals.spo2_percent)}%</td><td>${show(s.vitals.temperature_c)} °C</td></tr>`).join('')+'</tbody></table>';
 }catch(e){document.getElementById('state').textContent='Dashboard connection error'}} refresh(); setInterval(refresh,3000);
 </script></body></html>""", mimetype="text/html")
 
