@@ -1,4 +1,3 @@
 Flask>=3.0,<4.0
 gunicorn>=22.0,<24.0
 paho-mqtt>=1.6,<3.0
-pycryptodome>=3.20,<4.0
