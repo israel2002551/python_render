@@ -1,4 +1,4 @@
-"""Render-ready MQTT receiver for encrypted ESP32 FHIR observations."""
+"""Render-ready MQTT receiver for ESP32 FHIR observations."""
 
 import json
 import os
@@ -9,7 +9,6 @@ from urllib.request import Request, urlopen
 from collections import deque
 from datetime import datetime, timezone
 
-from Crypto.Cipher import AES
 from flask import Flask, Response, jsonify
 import paho.mqtt.client as mqtt
 
@@ -23,17 +22,6 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-sol")
 PREDICTION_COOLDOWN_SECONDS = 10
 
 
-def load_aes_key() -> bytes:
-    key_hex = os.getenv("AES_KEY_HEX", "03ee6748176c688d749ebd8f255ee337").strip()
-    if len(key_hex) != 32:
-        raise RuntimeError("AES_KEY_HEX must contain exactly 32 hexadecimal characters")
-    try:
-        return bytes.fromhex(key_hex)
-    except ValueError as exc:
-        raise RuntimeError("AES_KEY_HEX is not valid hexadecimal") from exc
-
-
-AES_KEY = load_aes_key()
 app = Flask(__name__)
 state_lock = threading.Lock()
 latest = {"updated_at": None, "vitals": {}, "messages_received": 0, "last_error": None}
@@ -53,16 +41,6 @@ LOINC_FIELDS = {
     "X-PTT": "ptt_ms",
     "X-DEMO-MODE": "demo_mode",
 }
-
-
-def decrypt_gcm_hex(payload: str) -> str:
-    if len(payload) < 56 or len(payload) % 2:
-        raise ValueError("invalid encrypted payload length")
-    nonce = bytes.fromhex(payload[:24])
-    ciphertext = bytes.fromhex(payload[24:-32])
-    tag = bytes.fromhex(payload[-32:])
-    cipher = AES.new(AES_KEY, AES.MODE_GCM, nonce=nonce)
-    return cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")
 
 
 def extract_vitals(bundle: dict) -> dict:
@@ -99,7 +77,7 @@ def create_sensor_summary(samples: list[dict]) -> str:
 def get_prediction_text(samples: list[dict]) -> str:
     if not samples:
         raise ValueError("No sensor readings are available yet")
-    api_key = os.getenv("OPENAI_API_KEY", "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").strip()
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("AI predictions are not configured")
 
@@ -154,7 +132,7 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
 
 def on_message(client, userdata, message):
     try:
-        bundle = json.loads(decrypt_gcm_hex(message.payload.decode("utf-8")))
+        bundle = json.loads(message.payload.decode("utf-8"))
         sample = {
             "received_at": datetime.now(timezone.utc).isoformat(),
             "vitals": extract_vitals(bundle),
@@ -235,12 +213,12 @@ h1{margin:0;font-size:1.7rem}.sub{color:#9fb0c8;margin-top:7px}.state{padding:8p
 .label{color:#9fb0c8;font-size:.85rem}.value{font-size:2rem;font-weight:700;margin-top:8px}.unit{font-size:.9rem;color:#9fb0c8;margin-left:4px}
 section{margin-top:28px;background:#101e31;border:1px solid #243a57;border-radius:14px;padding:18px}table{width:100%;border-collapse:collapse;font-size:.9rem}th,td{text-align:left;padding:10px;border-bottom:1px solid #243a57}th{color:#9fb0c8}.empty{color:#9fb0c8}
 .chart-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(310px,1fr));gap:16px}.chart{background:#0b1727;border:1px solid #243a57;border-radius:10px;padding:12px}.chart-title{font-size:.9rem;color:#b7caff;margin:0 0 8px}.chart canvas{display:block;width:100%;height:190px}.button{border:1px solid #39628f;border-radius:8px;background:#19324f;color:#e5edf8;padding:9px 12px;cursor:pointer;font:inherit}.button:disabled{opacity:.55;cursor:wait}.ai-result{white-space:pre-wrap;line-height:1.45;color:#d7e5f7}.notice{color:#9fb0c8;font-size:.9rem}.welcome{position:fixed;inset:0;z-index:2;display:grid;place-items:center;padding:20px;background:rgba(7,17,31,.96)}.welcome-card{max-width:480px;text-align:center;background:#101e31;border:1px solid #39628f;border-radius:16px;padding:32px}.welcome h2{margin-top:0}.hidden{display:none}
-</style></head><body><main><header><div><h1>ESP32 Health Monitor</h1><div class="sub">Encrypted FHIR telemetry</div></div><div class="state" id="state">Connecting…</div></header>
-<div class="grid" id="cards"></div><section><h2>Recent samples</h2><div id="recent" class="empty">Waiting for readings from the ESP32…</div></section></main>
+</style></head><body><main><header><div><h1>ESP32 Health Monitor</h1><div class="sub">FHIR telemetry</div></div><div class="state" id="state">Connectingâ€¦</div></header>
+<div class="grid" id="cards"></div><section><h2>Recent samples</h2><div id="recent" class="empty">Waiting for readings from the ESP32â€¦</div></section></main>
 <section><h2>AI sensor trend summary</h2><p class="notice">Uses recent readings only. It is not a diagnosis or a replacement for medical advice.</p><button class="button" id="predict" type="button">Analyze recent readings</button><div class="ai-result" id="prediction" aria-live="polite"></div></section>
 <section><h2>Live trends</h2><div class="chart-grid">
 <div class="chart"><p class="chart-title">Heart rate</p><canvas data-key="heart_rate_bpm" data-color="#ff6b6b"></canvas></div>
-<div class="chart"><p class="chart-title">Blood oxygen (SpO₂)</p><canvas data-key="spo2_percent" data-color="#43d9a3"></canvas></div>
+<div class="chart"><p class="chart-title">Blood oxygen (SpOâ‚‚)</p><canvas data-key="spo2_percent" data-color="#43d9a3"></canvas></div>
 <div class="chart"><p class="chart-title">Ambient temperature</p><canvas data-key="temperature_c" data-color="#bc7cff"></canvas></div>
 <div class="chart"><p class="chart-title">Humidity</p><canvas data-key="humidity_percent" data-color="#59c3ff"></canvas></div>
 <div class="chart"><p class="chart-title">Atmospheric pressure</p><canvas data-key="pressure_hpa" data-color="#f79d65"></canvas></div>
@@ -248,20 +226,20 @@ section{margin-top:28px;background:#101e31;border:1px solid #243a57;border-radiu
 </div></section>
 <div class="welcome" id="welcomeDialog" role="dialog" aria-modal="true" aria-labelledby="welcomeTitle"><div class="welcome-card"><h2 id="welcomeTitle">Welcome to Health Monitor</h2><p>Your live vital readings will appear after you start monitoring.</p><button class="button" id="start" type="button">Start monitoring</button></div></div>
 <script>
-const fields=[['heart_rate_bpm','Heart rate','bpm'],['systolic_bp_mmhg','Systolic BP','mmHg'],['diastolic_bp_mmhg','Diastolic BP','mmHg'],['spo2_percent','SpO₂','%'],['temperature_c','Ambient temperature','°C'],['humidity_percent','Humidity','%'],['pressure_hpa','Atmospheric pressure','hPa'],['respiratory_rate_bpm','Respiratory rate','breaths/min'],['ptt_ms','PTT','ms']];
+const fields=[['heart_rate_bpm','Heart rate','bpm'],['systolic_bp_mmhg','Systolic BP','mmHg'],['diastolic_bp_mmhg','Diastolic BP','mmHg'],['spo2_percent','SpOâ‚‚','%'],['temperature_c','Ambient temperature','Â°C'],['humidity_percent','Humidity','%'],['pressure_hpa','Atmospheric pressure','hPa'],['respiratory_rate_bpm','Respiratory rate','breaths/min'],['ptt_ms','PTT','ms']];
 const cards=document.querySelector('#cards'); cards.innerHTML=fields.map(([key,label,unit])=>`<div class="card"><div class="label">${label}</div><div class="value" id="${key}">--<span class="unit">${unit}</span></div></div>`).join('');
 document.getElementById('start').addEventListener('click',()=>document.getElementById('welcomeDialog').classList.add('hidden'));
 const predictButton=document.getElementById('predict'),prediction=document.getElementById('prediction');
-predictButton.addEventListener('click',async()=>{predictButton.disabled=true;prediction.textContent='Analyzing recent sensor readings…';try{const response=await fetch('/api/v1/predict',{method:'POST'}),body=await response.json();if(!response.ok)throw new Error(body.error||'Prediction request failed');prediction.textContent=body.prediction}catch(error){prediction.textContent=error.message}finally{predictButton.disabled=false}});
+predictButton.addEventListener('click',async()=>{predictButton.disabled=true;prediction.textContent='Analyzing recent sensor readingsâ€¦';try{const response=await fetch('/api/v1/predict',{method:'POST'}),body=await response.json();if(!response.ok)throw new Error(body.error||'Prediction request failed');prediction.textContent=body.prediction}catch(error){prediction.textContent=error.message}finally{predictButton.disabled=false}});
 function show(v){return Number.isFinite(v)?(Math.round(v*10)/10):'--'}
 function drawChart(canvas,samples){const values=samples.map(s=>s.vitals[canvas.dataset.key]).filter(Number.isFinite);const ctx=canvas.getContext('2d'),ratio=devicePixelRatio||1,w=canvas.clientWidth,h=canvas.clientHeight;canvas.width=w*ratio;canvas.height=h*ratio;ctx.scale(ratio,ratio);ctx.clearRect(0,0,w,h);if(!values.length){ctx.fillStyle='#9fb0c8';ctx.font='14px Arial';ctx.fillText('Waiting for data',14,32);return}let lo=Math.min(...values),hi=Math.max(...values),pad=Math.max((hi-lo)*.15,1);lo-=pad;hi+=pad;ctx.strokeStyle='#243a57';ctx.lineWidth=1;for(let i=0;i<4;i++){let y=18+i*(h-42)/3;ctx.beginPath();ctx.moveTo(38,y);ctx.lineTo(w-8,y);ctx.stroke()}ctx.fillStyle='#9fb0c8';ctx.font='11px Arial';ctx.fillText(hi.toFixed(1),2,22);ctx.fillText(lo.toFixed(1),2,h-19);const points=samples.map((s,i)=>({x:38+i*(w-48)/Math.max(samples.length-1,1),v:s.vitals[canvas.dataset.key]})).filter(p=>Number.isFinite(p.v));ctx.strokeStyle=canvas.dataset.color;ctx.lineWidth=2;ctx.beginPath();points.forEach((p,i)=>{const y=18+(hi-p.v)*(h-42)/(hi-lo);i?ctx.lineTo(p.x,y):ctx.moveTo(p.x,y)});ctx.stroke()}
 function drawCharts(history){document.querySelectorAll('canvas[data-key]').forEach(canvas=>drawChart(canvas,history))}
 async function refresh(){try{const [vitals,health,history]=await Promise.all([fetch('/api/v1/vitals').then(r=>r.json()),fetch('/healthz').then(r=>r.json()),fetch('/api/v1/history').then(r=>r.json())]);
 fields.forEach(([key,,unit])=>document.getElementById(key).innerHTML=`${show(vitals.vitals[key])}<span class="unit">${unit}</span>`);
-document.getElementById('state').textContent=vitals.vitals.demo_mode?'DEMO MODE — simulated':(health.mqtt_connected?'MQTT connected':'Waiting for MQTT');
+document.getElementById('state').textContent=vitals.vitals.demo_mode?'DEMO MODE â€” simulated':(health.mqtt_connected?'MQTT connected':'Waiting for MQTT');
 drawCharts(history);
-const recent=document.getElementById('recent'); if(!history.length){recent.textContent='Waiting for readings from the ESP32…';return}
-recent.innerHTML='<table><thead><tr><th>Received</th><th>Heart rate</th><th>SpO₂</th><th>Ambient temperature</th></tr></thead><tbody>'+history.slice(-10).reverse().map(s=>`<tr><td>${new Date(s.received_at).toLocaleTimeString()}</td><td>${show(s.vitals.heart_rate_bpm)} bpm</td><td>${show(s.vitals.spo2_percent)}%</td><td>${show(s.vitals.temperature_c)} °C</td></tr>`).join('')+'</tbody></table>';
+const recent=document.getElementById('recent'); if(!history.length){recent.textContent='Waiting for readings from the ESP32â€¦';return}
+recent.innerHTML='<table><thead><tr><th>Received</th><th>Heart rate</th><th>SpOâ‚‚</th><th>Ambient temperature</th></tr></thead><tbody>'+history.slice(-10).reverse().map(s=>`<tr><td>${new Date(s.received_at).toLocaleTimeString()}</td><td>${show(s.vitals.heart_rate_bpm)} bpm</td><td>${show(s.vitals.spo2_percent)}%</td><td>${show(s.vitals.temperature_c)} Â°C</td></tr>`).join('')+'</tbody></table>';
 }catch(e){document.getElementById('state').textContent='Dashboard connection error'}} refresh(); setInterval(refresh,3000);
 </script></body></html>""", mimetype="text/html")
 
