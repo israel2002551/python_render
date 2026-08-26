@@ -236,7 +236,7 @@ function drawChart(canvas,samples){const values=samples.map(s=>s.vitals[canvas.d
 function drawCharts(history){document.querySelectorAll('canvas[data-key]').forEach(canvas=>drawChart(canvas,history))}
 async function refresh(){try{const [vitals,health,history]=await Promise.all([fetch('/api/v1/vitals').then(r=>r.json()),fetch('/healthz').then(r=>r.json()),fetch('/api/v1/history').then(r=>r.json())]);
 fields.forEach(([key,,unit])=>document.getElementById(key).innerHTML=`${show(vitals.vitals[key])}<span class="unit">${unit}</span>`);
-document.getElementById('state').textContent=vitals.vitals.demo_mode?'DEMO MODE â€” simulated':(health.mqtt_connected?'MQTT connected':'Waiting for MQTT');
+document.getElementById('state').textContent=vitals.last_error?`MQTT error: ${vitals.last_error}`:(vitals.vitals.demo_mode?'DEMO MODE â€” simulated':(health.mqtt_connected?'MQTT connected':'Waiting for MQTT'));
 drawCharts(history);
 const recent=document.getElementById('recent'); if(!history.length){recent.textContent='Waiting for readings from the ESP32â€¦';return}
 recent.innerHTML='<table><thead><tr><th>Received</th><th>Heart rate</th><th>SpOâ‚‚</th><th>Ambient temperature</th></tr></thead><tbody>'+history.slice(-10).reverse().map(s=>`<tr><td>${new Date(s.received_at).toLocaleTimeString()}</td><td>${show(s.vitals.heart_rate_bpm)} bpm</td><td>${show(s.vitals.spo2_percent)}%</td><td>${show(s.vitals.temperature_c)} Â°C</td></tr>`).join('')+'</tbody></table>';
