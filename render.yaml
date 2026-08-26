@@ -6,8 +6,10 @@ services:
     startCommand: gunicorn --workers 1 --bind 0.0.0.0:$PORT health:app
     healthCheckPath: /healthz
     envVars:
-      - key: AES_KEY_HEX
+      - key: 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
         sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5.6-sol
       - key: MQTT_BROKER
         value: broker.hivemq.com
       - key: MQTT_PORT
